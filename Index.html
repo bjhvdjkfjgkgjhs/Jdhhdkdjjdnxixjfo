@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Attic-Style AWS NEXRAD Viewer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<link href="https://api.mapbox.com/mapbox-gl-js/v3.4.0/mapbox-gl.css" rel="stylesheet"/>
+<script src="https://api.mapbox.com/mapbox-gl-js/v3.4.0/mapbox-gl.js"></script>
+<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+
+<style>
+html, body { margin:0; padding:0; background:#0a0f16; height:100%; }
+#map { width:100vw; height:100vh; }
+
+#controlPanel {
+  position:absolute; top:12px; left:12px;
+  background:rgba(0,0,0,0.55); color:#fff;
+  padding:12px; width:230px; border-radius:6px;
+  font-family:Arial, sans-serif; z-index:9999;
+}
+#controlPanel select {
+  width:100%; padding:6px;
+  background:#111; color:#fff;
+  border:1px solid #444; border-radius:4px;
+}
+.titleLabel { font-weight:bold; margin-top:6px; display:block; }
+
+#texturecolorbar, #mapColorScale, #colorScalePicker { display:none; }
+</style>
+</head>
+
+<body>
+
+<div id="map"></div>
+
+<div id="controlPanel">
+  <span class="titleLabel">Radar Site</span>
+  <select id="radarSelect"></select>
+
+  <span class="titleLabel">Tilt</span>
+  <select id="tiltSelect">
+      <option value="1">0.5°</option>
+      <option value="2">1.5°</option>
+      <option value="3">2.4°</option>
+      <option value="4">3.4°</option>
+  </select>
+</div>
+
+<canvas id="texturecolorbar"></canvas>
+<canvas id="mapColorScale"></canvas>
+<div id="colorScalePicker"></div>
+
+<!-- ALL YOUR UPLOADED FILES -->
+<script src="nexrad_locations.js"></script>
+<script src="nexrad_station_abbreviations.js"></script>
+<script src="detect_level.js"></script>
+<script src="loaders_nexrad.js"></script>
+<script src="plot_storm_tracks.js"></script>
+<script src="plot_tornado_vortex_signature.js"></script>
+<script src="init_storm_tracks.js"></script>
+<script src="plot_to_map.js"></script>
+<script src="calculate_coordinates.js"></script>
+<script src="create_WebGL_texture.js"></script>
+<script src="create_and_show_colorbar.js"></script>
+<script src="level2_factory.js"></script>
+<script src="level2_parser.js"></script>
+<script src="level2_constants.js"></script>
+<script src="decompress_worker.js"></script>
+<script src="calculation_worker.js"></script>
+
+<script>
+window.atticData = {
+  current_radar: "KILN",
+  current_tilt: 1,
+  product_code: "N0Q",
+  radar_mesh_ready: false
+};
+</script>
+
+<script>
+async function getLatestAWS(radar, product="N0Q") {
+  const res = await fetch(
+      `https://unidata-nexrad-level3.s3.amazonaws.com/latest?radar=${radar}&product=${product}`
+  );
+  if (!res.ok) return null;
+  const js = await res.json();
+  return "https://unidata-nexrad-level3.s3.amazonaws.com/" + js.latest;
+}
+
+async function fetchBinary(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error("Radar fetch error");
+  return new Uint8Array(await r.arrayBuffer());
+}
+
+/* LEVEL-III N0Q DECODER */
+function decodeN0Q_L3(bin) {
+  let rays = [];
+  let ptr = 0;
+
+  function dbz(v) {
+    if (v === 0) return null;
+    return (v - 66) / 2;
+  }
+
+  while (ptr < bin.length - 600) {
+    const az = bin[ptr];
+    const count = bin[ptr+1];
+    if (count < 1 || count > 2000) break;
+
+    const arr = [];
+    for (let i = 0; i < count; i++)
+      arr.push(dbz(bin[ptr+2+i]));
+
+    rays.push({
+      azimuth: az * 1.40625,
+      bins: arr
+    });
+
+    ptr += 2 + count;
+  }
+
+  return rays;
+}
+
+function buildN0QFactory(radar, rays) {
+  return {
+    nexrad_level: 3,
+    product_abbv: "N0Q",
+    product_code: "N0Q",
+    station: radar,
+
+    get_location() {
+      return window.NEXRAD_LOCATIONS[radar] || [39,-84,""];
+    },
+
+    get_azimuth_angles() {
+      return rays.map(r => r.azimuth);
+    },
+
+    get_ranges() {
+      const a = [];
+      for (let i=0;i<1800;i++) a.push(i*0.25);
+      return a;
+    },
+
+    get_data() {
+      return rays.map(r => r.bins);
+    }
+  };
+}
+
+function loadStormTracks() {
+  if (window.init_storm_tracks?.fetch_data)
+      window.init_storm_tracks.fetch_data();
+}
+
+function loadTVS() {
+  if (window.plot_tornado_vortex_signature)
+      window.plot_tornado_vortex_signature();
+}
+
+async function updateRadar() {
+  try {
+    const radar = window.atticData.current_radar;
+    const tilt  = window.atticData.current_tilt;
+
+    const url = await getLatestAWS(radar, "N0Q");
+    const raw = await fetchBinary(url);
+    const rays = decodeN0Q_L3(raw);
+
+    const factory = buildN0QFactory(radar, rays);
+
+    calculate_coordinates(factory, {
+      product: "REF",
+      elevation: tilt
+    });
+
+    loadStormTracks();
+    loadTVS();
+
+  } catch (e) {
+    console.error("Radar update failed:", e);
+  }
+}
+
+setInterval(updateRadar, 120000);
+</script>
+
+<script>
+function populateRadarList() {
+  const sel = document.getElementById("radarSelect");
+  sel.innerHTML = "";
+
+  const keys = Object.keys(NEXRAD_LOCATIONS).sort();
+  keys.forEach(k => {
+    const op = document.createElement("option");
+    op.value = k;
+    op.textContent = `${k} — ${NEXRAD_LOCATIONS[k][2] || ""}`;
+    sel.appendChild(op);
+  });
+
+  if (keys.includes("KILN"))
+    sel.value = "KILN";
+}
+
+mapboxgl.accessToken =
+"pk.eyJ1IjoiYm1kMjM0NTY3IiwiYSI6ImNtYThuOHN5YzA3dDAybnB1bzNxZDY3cW8ifQ.fx86lChOVdESr3OII-C2NA";
+
+let map;
+
+function initMap() {
+  map = new mapboxgl.Map({
+    container: "map",
+    style: "mapbox://styles/mapbox/dark-v11",
+    center: [-85,39],
+    zoom:5,
+    attributionControl:false
+  });
+
+  map.on("load", () => updateRadar());
+}
+
+document.getElementById("radarSelect").addEventListener("change", e=>{
+  window.atticData.current_radar = e.target.value;
+  const loc = NEXRAD_LOCATIONS[e.target.value];
+  if (loc) {
+    map.flyTo({ center:[loc[1],loc[0]], zoom:7 });
+  }
+  updateRadar();
+});
+
+document.getElementById("tiltSelect").addEventListener("change", e=>{
+  window.atticData.current_tilt = Number(e.target.value);
+  updateRadar();
+});
+
+populateRadarList();
+initMap();
+</script>
+
+</body>
+</html>
